@@ -1,0 +1,1820 @@
+
+class Config:
+    SECRET_KEY = '7fa11dcf40c16ac205a65e3e6b8097afe1de12505c02dec0321be84f5eac0bbe' 
+    USER = 'postgres'
+    PASSWORD = '444444'
+    HOST = 'localhost'
+    DB = 'postgres'
+    PORT = '5432'
+    
+
+    DB_PASS = 'Pakzone_123456'
+    DB_URL = "postgresql://postgres:Pakzone_123456@db.muicxfpyxpozqemarakn.supabase.co:5432/postgres"
+
+import io
+import os
+import math
+from math import radians, sin, cos, sqrt, atan2
+from collections import defaultdict
+from itertools import permutations
+from functools import wraps
+
+import heapq
+import pandas as pd
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify, 
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from dotenv import load_dotenv
+from loguru import logger
+
+from config import Config
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# Get the connection string from .env
+DATABASE_URL = 'postgresql://postgres.muicxfpyxpozqemarakn:Pakzone_123456@aws-0-eu-central-1.pooler.supabase.com:6543/postgres'
+
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"Ошибка подключения к БД: {e}")
+        raise
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or session['role'] != 'Администратор':
+            flash('Доступ запрещен. Требуются права администратора.')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+        
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Добавляем отладочную информацию
+        print(f"Попытка входа: пользователь={username}")
+        
+        cursor.execute(
+            "SELECT id, password_hash, role FROM auth_users WHERE login = %s",
+            (username,)
+        )
+        user = cursor.fetchone()
+        
+        if user:
+            print(f"Найден пользователь: {username}")
+            print(f"Хеш пароля в БД: {user[1]}")
+            is_valid = check_password_hash(user[1], password)
+            print(f"Проверка пароля: {'успешно' if is_valid else 'неуспешно'}")
+        else:
+            print(f"Пользователь не найден: {username}")
+        
+        cursor.close()
+        conn.close()
+        
+        if user and check_password_hash(user[1], password):
+            session['user_id'] = user[0]
+            session['role'] = user[2]
+            return redirect(url_for('dashboard'))
+            
+        flash('Неверное имя пользователя или пароль')
+        
+    return render_template('login.html')
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html', role=session['role'])
+
+@app.route('/users', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def manage_users():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if request.method == 'POST':
+        if 'delete_user' in request.form:
+            user_id = request.form['delete_user']
+            cursor.execute("DELETE FROM auth_users WHERE id = %s", (user_id,))
+            conn.commit()
+            flash('Пользователь успешно удален')
+        else:
+            username = request.form['username']
+            password = request.form['password']
+            role = request.form['role']
+            
+            # Проверка существования пользователя
+            cursor.execute("SELECT id FROM auth_users WHERE login = %s", (username,))
+            if cursor.fetchone():
+                flash('Пользователь с таким логином уже существует')
+            else:
+                password_hash = generate_password_hash(password)
+                cursor.execute(
+                    "INSERT INTO auth_users (login, password_hash, role, created_at) "
+                    "VALUES (%s, %s, %s, CURRENT_TIMESTAMP)",
+                    (username, password_hash, role)
+                )
+                conn.commit()
+                flash('Пользователь успешно добавлен')
+    
+    cursor.execute(
+        "SELECT id, login, role, created_at FROM auth_users ORDER BY created_at ASC"
+    )
+    users = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    
+    return render_template('users.html', users=users)
+
+@app.route('/product-catalog', methods=['GET', 'POST'])
+@login_required
+def product_catalog():
+
+    # Словарь для перевода названий колонок
+    column_translations = {
+        'name': 'Наименование',
+        'article_wb': 'Артикул WB',
+        'barcode': 'Штрих-код',
+        'package_width': 'Ширина упаковки (см)',
+        'package_height': 'Высота упаковки (см)',
+        'package_length': 'Длина упаковки (см)',
+        'weight_without_package': 'Вес без упаковки (г)',
+        'weight_with_package': 'Вес с упаковкой (г)',
+        'quantity_per_box': 'Количество в коробке',
+        'created_at': 'Дата создания'
+    }
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if request.method == 'POST':
+        try:
+            name = request.form['name']
+            article_wb = request.form['article_wb']
+            barcode = request.form['barcode']
+            package_width = float(request.form['package_width'])
+            package_height = float(request.form['package_height'])
+            package_length = float(request.form['package_length'])
+            weight_without_package = float(request.form['weight_without_package'])
+            weight_with_package = float(request.form['weight_with_package'])
+            quantity_per_box = int(request.form['quantity_per_box'])
+            
+            cursor.execute("""
+                INSERT INTO product_catalog (
+                    name, article_wb, barcode, 
+                    package_width, package_height, package_length,
+                    weight_without_package, weight_with_package, 
+                    quantity_per_box, created_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP
+                )
+            """, (
+                name, article_wb, barcode,
+                package_width, package_height, package_length,
+                weight_without_package, weight_with_package,
+                quantity_per_box
+            ))
+            
+            conn.commit()
+            
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return jsonify({'success': True})
+            
+            flash('Товар успешно добавлен в каталог')
+            
+        except Exception as e:
+            print(f"Ошибка при добавлении товара: {e}")
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return jsonify({'success': False, 'error': str(e)})
+            flash('Ошибка при добавлении товара')
+    
+    cursor.execute("""
+        SELECT name, article_wb, barcode, 
+               package_width, package_height, package_length,
+               weight_without_package, weight_with_package, 
+               quantity_per_box, created_at 
+        FROM product_catalog 
+        ORDER BY id ASC
+    """)
+    products = cursor.fetchall()
+    column_names = [desc[0] for desc in cursor.description]
+    
+    # Переводим названия колонок
+    translated_columns = [column_translations.get(col, col) for col in column_names]
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template(
+        'product_catalog.html',
+        products=products,
+        columns=translated_columns
+    )
+
+@app.route('/delete-product/<identifier>', methods=['DELETE'])
+@login_required
+def delete_product(identifier):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Пробуем удалить по артикулу или баркоду
+        cursor.execute("""
+            DELETE FROM product_catalog 
+            WHERE article_wb = %s OR barcode = %s
+        """, (identifier, identifier))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Ошибка при удалении товара: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+    
+
+@app.route('/orders', methods=['GET', 'POST', 'PUT'])
+@login_required
+def orders():
+    if request.method == 'POST':
+        try:
+            print("Получены данные формы:", request.form)  # Логируем полученные данные
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Получаем данные из формы
+            data = {
+                'supplier': request.form.get('supplier'),
+                'order_date': request.form.get('order_date'),
+                'product_name': request.form.get('product_name'),
+                'barcode': request.form.get('barcode'),
+                'article': request.form.get('article'),
+                'internal_order_number': request.form.get('internal_order_number'),
+                'quantity': request.form.get('quantity'),
+                'price_per_unit': request.form.get('price_per_unit'),
+                'exchange_rate_yuan': request.form.get('exchange_rate_yuan'),
+                'total_price_yuan': request.form.get('total_yuan'),
+                'exchange_rate_rub': request.form.get('exchange_rate_rub'),
+                'total_price_rub': request.form.get('total_rub'),
+                'payment_status': request.form.get('payment_status') == 'true',
+                'delivery_status': request.form.get('delivery_status'),
+                'external_invoice_number': request.form.get('external_invoice_number'),
+                'total_places': request.form.get('total_places'),
+                'total_weight_kg': request.form.get('total_weight_kg'),
+                'volume_cubic': request.form.get('volume_cubic'),
+                'delivery_cost_usd': request.form.get('delivery_cost_usd'),
+                'price_per_kg_usd': request.form.get('price_per_kg'),
+                'warehouse_arrival': request.form.get('warehouse_arrival'),
+                'delivery_cost_rub': request.form.get('delivery_cost_rub'),
+                'delivery_cost_to_warehouse': request.form.get('delivery_cost_to_warehouse'),
+                'ff_work_and_distribution': request.form.get('ff_work_and_distribution'),
+                'incoming_registered': request.form.get('incoming_registered') == 'true',
+                'weight_per_unit': request.form.get('weight_per_unit')
+            }
+            
+            print("Подготовленные данные:", data)  # Логируем обработанные данные
+            
+            # Формируем SQL запрос
+            fields = ', '.join(data.keys())
+            placeholders = ', '.join(['%s'] * len(data))
+            sql = f"""
+                INSERT INTO product_orders ({fields})
+                VALUES ({placeholders})
+            """
+            
+            print("SQL запрос:", sql)  # Логируем SQL запрос
+            print("Значения:", tuple(data.values()))  # Логируем значения
+            
+            # Выполняем запрос
+            cursor.execute(sql, tuple(data.values()))
+            conn.commit()
+            
+            # Получаем созданную запись
+            cursor.execute("""
+                SELECT * FROM product_orders 
+                WHERE internal_order_number = %s
+            """, (data['internal_order_number'],))
+            
+            new_order = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'order': new_order
+            })
+            
+        except Exception as e:
+            print(f"Ошибка при сохранении заказа: {e}")
+            print(f"Детали ошибки:", str(e.__class__), str(e.__dict__))  # Подробности об ошибке
+            return jsonify({'success': False, 'error': str(e)})
+        
+    elif request.method == 'PUT':
+        try:
+            data = {}
+            form_data = request.form
+            
+            # Безопасное преобразование типов с значениями по умолчанию
+            for key, value in form_data.items():
+                if value == '':
+                    data[key] = None
+                elif key in ['quantity', 'total_places']:  # целые числа
+                    data[key] = int(value) if value else 0
+                elif key in ['price_per_unit', 'exchange_rate_yuan', 'exchange_rate_rub',
+                           'total_weight_kg', 'volume_cubic', 'delivery_cost_usd',
+                           'delivery_cost_to_warehouse', 'ff_work_and_distribution']:  # float
+                    data[key] = float(value) if value else 0.0
+                elif key in ['payment_status', 'incoming_registered']:  # boolean
+                    data[key] = value.lower() == 'true'
+                else:  # строки
+                    data[key] = value
+
+            # Выполнение SQL запроса...
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Если приход внесен стал True
+            if data.get('incoming_registered') == 'true':
+                print(f"Обработка прихода: дата={arrival_date}, количество={quantity}, штрих-код={barcode}")
+                # Получаем дату прибытия и количество из заказа
+                arrival_date = data.get('warehouse_arrival')
+                quantity = data.get('quantity')
+                barcode = data.get('barcode')
+                
+                # Добавляем новую колонку с датой прибытия, если её нет
+                cursor.execute("""
+                    ALTER TABLE public.stock_availability 
+                    ADD COLUMN IF NOT EXISTS "quantity_{}" integer
+                """.format(arrival_date.replace('-', '_')))
+                
+                # Обновляем значение для соответствующего товара
+                cursor.execute("""
+                    UPDATE public.stock_availability 
+                    SET "quantity_{}" = %s 
+                    WHERE barcode = %s
+                """.format(arrival_date.replace('-', '_')), (quantity, barcode))
+            
+            update_fields = [f"{key} = %s" for key in data.keys()]
+            sql = f"""
+                UPDATE product_orders 
+                SET {', '.join(update_fields)}
+                WHERE internal_order_number = %s
+            """
+            
+            cursor.execute(sql, list(data.values()) + [data['internal_order_number']])
+            conn.commit()
+            
+            return jsonify({'success': True})
+            
+        except Exception as e:
+            print(f"Ошибка при обновлении заказа: {e}")
+            return jsonify({'success': False, 'error': str(e)})
+        
+    # Словарь для перевода названий колонок
+    column_translations = {
+        'supplier': 'Поставщик',
+        'order_date': 'Дата заказа',
+        'product_name': 'Наименование товара',
+        'barcode': 'Штрих-код',
+        'article': 'Артикул',
+        'internal_order_number': 'Внутренний номер заказа',
+        'quantity': 'Количество',
+        'price_per_unit': 'Цена за 1 шт',
+        'exchange_rate_yuan': 'Курс юаня',
+        'total_price_yuan': 'Сумма в юанях',
+        'exchange_rate_rub': 'Курс РФ',
+        'total_price_rub': 'Сумма в рублях',
+        'payment_status': 'Статус оплаты',
+        'delivery_status': 'Статус доставки',
+        'external_invoice_number': 'Номер накладной',
+        'total_places': 'Количество мест',
+        'total_weight_kg': 'Общий вес (кг)',
+        'volume_cubic': 'Объем (м³)',
+        'delivery_cost_usd': 'Стоимость доставки ($)',
+        'price_per_kg_usd': 'Цена за кг ($)',
+        'warehouse_arrival': 'Дата прибытия',
+        'delivery_cost_rub': 'Стоимость доставки (₽)',
+        'delivery_cost_to_warehouse': 'Доставка до склада (₽)',
+        'ff_work_and_distribution': 'Работа ФФ',
+        'incoming_registered': 'Приход внесен',
+        'weight_per_unit': 'Вес единицы товара'
+    }
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+     # Получаем список товаров из каталога
+    cursor.execute("SELECT name, article_wb, barcode FROM product_catalog")
+    products = cursor.fetchall()
+    
+    # Получаем все колонки кроме id
+    cursor.execute("""
+        SELECT supplier, order_date, product_name, barcode, article,
+               internal_order_number, quantity, price_per_unit,
+               exchange_rate_yuan, total_price_yuan, exchange_rate_rub,
+               total_price_rub, payment_status, delivery_status,
+               external_invoice_number, total_places, total_weight_kg,
+               volume_cubic, delivery_cost_usd, price_per_kg_usd,
+               warehouse_arrival, delivery_cost_rub,
+               delivery_cost_to_warehouse, ff_work_and_distribution,
+               incoming_registered, weight_per_unit
+        FROM product_orders 
+        ORDER BY order_date DESC
+    """)
+    
+    orders = cursor.fetchall()
+    column_names = [desc[0] for desc in cursor.description]
+    
+    # Переводим названия колонок
+    translated_columns = [column_translations.get(col, col) for col in column_names]
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template(
+        'orders.html',
+        orders=orders,
+        products=products,
+        columns=translated_columns
+    )
+    
+@app.route('/update_order', methods=['POST'])
+@login_required
+def update_order():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Получаем данные из формы
+        data = {
+            'supplier': request.form.get('supplier'),
+            'order_date': request.form.get('order_date'),
+            'product_name': request.form.get('product_name'),
+            'barcode': request.form.get('barcode'),
+            'article': request.form.get('article'),
+            'internal_order_number': request.form.get('internal_order_number'),
+            'quantity': request.form.get('quantity'),
+            'price_per_unit': request.form.get('price_per_unit'),
+            'exchange_rate_yuan': request.form.get('exchange_rate_yuan'),
+            'total_price_yuan': request.form.get('total_price_yuan'),
+            'exchange_rate_rub': request.form.get('exchange_rate_rub'),
+            'total_price_rub': request.form.get('total_price_rub'),
+            'payment_status': request.form.get('payment_status') == 'true',
+            'delivery_status': request.form.get('delivery_status'),
+            'external_invoice_number': request.form.get('external_invoice_number'),
+            'total_places': request.form.get('total_places'),
+            'total_weight_kg': request.form.get('total_weight_kg'),
+            'volume_cubic': request.form.get('volume_cubic'),
+            'delivery_cost_usd': request.form.get('delivery_cost_usd'),
+            'price_per_kg_usd': request.form.get('price_per_kg_usd'),
+            'warehouse_arrival': request.form.get('warehouse_arrival'),
+            'delivery_cost_rub': request.form.get('delivery_cost_rub'),
+            'delivery_cost_to_warehouse': request.form.get('delivery_cost_to_warehouse'),
+            'ff_work_and_distribution': request.form.get('ff_work_and_distribution'),
+            'incoming_registered': request.form.get('incoming_registered') == 'true',
+            'weight_per_unit': request.form.get('weight_per_unit')
+        }
+        
+        # Формируем SQL запрос для обновления
+        update_fields = [f"{key} = %s" for key in data.keys()]
+        sql = f"""
+            UPDATE product_orders 
+            SET {', '.join(update_fields)}
+            WHERE internal_order_number = %s
+        """
+        
+        # Выполняем запрос
+        cursor.execute(sql, list(data.values()) + [data['internal_order_number']])
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"Ошибка при обновлении заказа: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+    
+
+@app.route('/stock-availability')
+@login_required
+def stock_availability():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем список колонок с датами
+    cursor.execute("""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'stock_availability' 
+        AND column_name ~ '^[0-9]{4}_[0-9]{2}_[0-9]{2}$'
+        ORDER BY column_name
+    """)
+    date_columns = [col[0] for col in cursor.fetchall()]
+    
+    # Формируем SQL запрос с явным указанием колонок
+    columns_sql = f"""
+        SELECT 
+            barcode, 
+            name, 
+            article_wb, 
+            quantity_per_box,
+            total_quantity
+        FROM stock_availability 
+    """
+    
+    cursor.execute(columns_sql)
+    stock_items = cursor.fetchall()
+    
+    # Маппинг колонок
+    column_mapping = {
+        'barcode': 'Штрих-код',
+        'name': 'Наименование товара',
+        'article_wb': 'Артикул товара',
+        'quantity_per_box': 'Количество в коробке',
+        'total_quantity': 'Итого'
+    }
+
+    # Формируем список колонок для отображения
+    columns = [column_mapping[col] for col in ['barcode', 'name', 'article_wb', 'quantity_per_box']]
+    columns.extend([col.replace('_', '-') for col in date_columns])
+    columns.append(column_mapping['total_quantity'])
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template(
+        'stock_availability.html',
+        stock_items=stock_items,
+        columns=columns
+    )
+
+@app.route('/update-stock', methods=['POST'])
+@login_required
+def update_stock():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. Добавляем новые товары из product_catalog в stock_availability
+        cursor.execute("""
+            INSERT INTO stock_availability (product_id, barcode, name, article_wb, quantity_per_box)
+            SELECT id, barcode, name, article_wb, quantity_per_box
+            FROM product_catalog
+            WHERE barcode NOT IN (SELECT barcode FROM stock_availability)
+        """)
+
+        # 2. Обновляем total_quantity на основе зарегистрированных поступлений
+        cursor.execute("""
+            UPDATE stock_availability sa
+            SET total_quantity = COALESCE(
+                (SELECT SUM(po.quantity)
+                FROM product_orders po
+                WHERE po.barcode = sa.barcode
+                AND po.incoming_registered = true),
+                0
+            )
+        """)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"Ошибка при обновлении остатков: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
+    
+
+def add_cost_calculation_data():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем данные из таблицы orders
+    cursor.execute("""
+        SELECT 
+            internal_order_number,
+            product_name,
+            article,
+            barcode,
+            quantity,
+            total_price_rub,
+            delivery_cost_rub,
+            delivery_cost_to_warehouse,
+            ff_work_and_distribution,
+            (
+                   total_price_rub + 
+                   delivery_cost_rub + 
+                   delivery_cost_to_warehouse + 
+                   ff_work_and_distribution) as total_amount_rub,
+            ROUND(
+                   (
+                   total_price_rub + 
+                   delivery_cost_rub + 
+                   delivery_cost_to_warehouse + 
+                   ff_work_and_distribution)::numeric / NULLIF(quantity, 0)::numeric, 
+                2
+            ) as unit_price_rub
+        FROM product_orders
+        ORDER BY internal_order_number DESC
+    """)
+    orders_data = cursor.fetchall()
+
+    # Вставляем данные в таблицу cost_calculation
+    insert_query = """
+        INSERT INTO cost_calculation (
+            internal_order_number,
+            product_name,
+            article,
+            barcode,
+            quantity,
+            total_price_rub,
+            delivery_cost_rub,
+            warehouse_delivery_rub,
+            ff_work_and_distribution,
+            final_total_rub,
+            price_per_item_rub
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    for order in orders_data:
+        cursor.execute(insert_query, order)
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    
+@app.route('/cost-calculation')
+@login_required
+def cost_calculation():
+
+    add_cost_calculation_data()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем обновленные данные для отображения
+    cursor.execute("""
+        SELECT 
+            internal_order_number,
+            product_name,
+            article,
+            barcode,
+            quantity,
+            total_price_rub,
+            delivery_cost_rub,
+            warehouse_delivery_rub,
+            ff_work_and_distribution,
+            final_total_rub,
+            price_per_item_rub
+        FROM cost_calculation
+        ORDER BY internal_order_number DESC
+    """)
+    
+    items = cursor.fetchall()
+    
+    columns = [
+        'Внутренний номер заказа',
+        'Наименование',
+        'Артикул ВБ',
+        'Баркод',
+        'Количество',
+        'Сумма в рублях',
+        'Доставка, руб',
+        'Доставка до склада, руб',
+        'Работа ФФ и отправка по складам',
+        'Общая сумма, руб.',
+        'Цена за товара, руб.'
+    ]
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template(
+        'cost_calculation.html',
+        items=items,
+        columns=columns
+    )
+
+@app.route('/update-cost-calculation', methods=['POST'])
+@login_required
+def update_cost_calculation():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        #  1. Очищаем таблицу `cost_calculation`
+        cursor.execute("TRUNCATE TABLE cost_calculation RESTART IDENTITY CASCADE")
+
+        #  2. Добавляем новые данные
+        cursor.execute("""
+            INSERT INTO cost_calculation (
+                internal_order_number,
+                product_name,
+                article,
+                barcode,
+                quantity,
+                total_price_rub,
+                delivery_cost_rub,
+                warehouse_delivery_rub,
+                ff_work_and_distribution,
+                final_total_rub,
+                price_per_item_rub
+            )
+            SELECT 
+                internal_order_number,
+                product_name,
+                article,
+                barcode,
+                quantity,
+                total_price_rub,
+                delivery_cost_rub,
+                delivery_cost_to_warehouse,
+                ff_work_and_distribution,
+                (
+                       total_price_rub + 
+                       delivery_cost_rub + 
+                       delivery_cost_to_warehouse + 
+                       ff_work_and_distribution
+                ) as final_total_rub,
+                ROUND(
+                       (
+                       total_price_rub + 
+                       delivery_cost_rub + 
+                       delivery_cost_to_warehouse + 
+                       ff_work_and_distribution)::numeric / NULLIF(quantity, 0)::numeric, 
+                    2
+                ) as price_per_item_rub
+            FROM product_orders
+        """)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        print(f"Ошибка при обновлении данных: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/price-calculation')
+@login_required
+def price_calculation():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем базовые данные из cost_calculation
+    cursor.execute("""
+        SELECT 
+            article,
+            barcode,
+            price_per_item_rub as cost_price
+        FROM cost_calculation
+        ORDER BY article
+    """)
+    
+    items = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    
+    columns = [
+        'Артикул ВБ', 
+        'Баркод', 
+        'Себестоимость', 
+        'Цена до скидок', 
+        'Скидка %', 
+        'Розничная цена', 
+        '% СПП', 
+        '% Кошелек', 
+        'Конечная цена',
+        'Платная приемка', 
+        'Комиссия (%)', 
+        'Комиссия (руб)', 
+        'Стоимость логистики', 
+        'Индекс выкупа', 
+        'Доставка',
+        'Хранение', 
+        'Кол-во дней', 
+        'Налог (руб)', 
+        'Реклама (руб)',
+        'ДРР %', 
+        'Прибыль', 
+        'Маржа %', 
+        '% прибыли от себестоимости', 
+        'Наценка к СС'
+    ]
+    
+    return render_template('price_calculation.html', items=items, columns=columns)
+
+@app.route('/api/save-price-calculation', methods=['POST'])
+@login_required
+def save_price_calculation():
+    try:
+        data = request.json
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Проверяем существование записи
+        cursor.execute(
+            "SELECT id FROM sales_pricing WHERE article_wb = %s",
+            (data['article_wb'],)
+        )
+        exists = cursor.fetchone()
+        
+        if exists:
+            # Обновляем существующую запись
+            sql = """
+            UPDATE sales_pricing SET
+                product_name = %s, barcode = %s, cost_price = %s,
+                price_before_discount = %s, discount_percent = %s, retail_price = %s,
+                spp_percent = %s, wallet_percent = %s, final_price = %s,
+                paid_acceptance_rub = %s, commission_percent = %s, commission_rub = %s,
+                logistics_cost = %s, buyout_index = %s, storage_cost = %s,
+                storage_days = %s, delivery_cost = %s, tax_rub = %s,
+                advertising_cost = %s, drr_percent = %s, profit = %s,
+                margin_percent = %s, profit_percent_from_cost = %s, markup_to_cost = %s
+            WHERE article_wb = %s
+            """
+            values = (
+                data['product_name'], data['barcode'], data['cost_price'],
+                data['price_before_discount'], data['discount_percent'], data['retail_price'],
+                data['spp_percent'], data['wallet_percent'], data['final_price'],
+                data['paid_acceptance_rub'], data['commission_percent'], data['commission_rub'],
+                data['logistics_cost'], data['buyout_index'], data['storage_cost'],
+                data['storage_days'], data['delivery_cost'], data['tax_rub'],
+                data['advertising_cost'], data['drr_percent'], data['profit'],
+                data['margin_percent'], data['profit_percent_from_cost'], data['markup_to_cost'],
+                data['article_wb']
+            )
+        else:
+            # Вставляем новую запись
+            sql = """
+            INSERT INTO sales_pricing (
+                product_name, article_wb, barcode, cost_price, 
+                price_before_discount, discount_percent, retail_price,
+                spp_percent, wallet_percent, final_price,
+                paid_acceptance_rub, commission_percent, commission_rub,
+                logistics_cost, buyout_index, storage_cost,
+                storage_days, delivery_cost, tax_rub,
+                advertising_cost, drr_percent, profit,
+                margin_percent, profit_percent_from_cost, markup_to_cost
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            """
+            values = (
+                data['product_name'], data['article_wb'], data['barcode'],
+                data['cost_price'], data['price_before_discount'],
+                data['discount_percent'], data['retail_price'],
+                data['spp_percent'], data['wallet_percent'],
+                data['final_price'], data['paid_acceptance_rub'],
+                data['commission_percent'], data['commission_rub'],
+                data['logistics_cost'], data['buyout_index'],
+                data['storage_cost'], data['storage_days'],
+                data['delivery_cost'], data['tax_rub'],
+                data['advertising_cost'], data['drr_percent'],
+                data['profit'], data['margin_percent'],
+                data['profit_percent_from_cost'], data['markup_to_cost']
+            )
+        
+        cursor.execute(sql, values)
+        conn.commit()
+        
+        action = "обновлен" if exists else "сохранен"
+        return jsonify({
+            "success": True,
+            "message": f"Расчет успешно {action}"
+        })
+        
+    except Exception as e:
+        print(f"Error saving price calculation: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+        
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/warehouses')
+@login_required
+def warehouses():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, warehouse_name, city, address, recipient_name, phone_number, created_at 
+        FROM warehouses 
+        ORDER BY id
+    """)
+    warehouses = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template('warehouses.html', warehouses=warehouses)
+
+@app.route('/add_warehouse', methods=['POST'])
+@login_required
+def add_warehouse():
+    data = request.json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO warehouses (warehouse_name, city, address, recipient_name, phone_number)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data['warehouse_name'],
+            data['city'],
+            data['address'],
+            data['recipient_name'],
+            data['phone_number']
+        ))
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        
+        # Получаем добавленную запись для возврата
+        cursor.execute("""
+            SELECT id, warehouse_name, city, address, recipient_name, phone_number, created_at 
+            FROM warehouses WHERE id = %s
+        """, (new_id,))
+        new_warehouse = cursor.fetchone()
+        
+        return jsonify({
+            'success': True,
+            'warehouse': new_warehouse
+        })
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/delete_warehouse/<int:warehouse_id>', methods=['DELETE'])
+@login_required
+def delete_warehouse(warehouse_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("DELETE FROM warehouses WHERE id = %s", (warehouse_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/cars')
+@login_required
+def cars():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, brand, plate_number, capacity, driver,created_at 
+        FROM cars 
+        ORDER BY id
+    """)
+    cars = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template('cars.html', cars=cars)
+
+@app.route('/add_car', methods=['POST'])
+@login_required
+def add_car():
+    data = request.json
+    print("Received data:", data)  # Добавляем логирование
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO cars (brand, plate_number, capacity, driver)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data['brand'],
+            data['plate_number'],
+            float(data['capacity']),  # Преобразуем в float
+            data['driver']
+        ))
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        
+        cursor.execute("""
+            SELECT id, brand, plate_number, capacity, driver, created_at  
+            FROM cars WHERE id = %s
+        """, (new_id,))
+        new_car = cursor.fetchone()
+        
+        return jsonify({
+            'success': True,
+            'car': new_car
+        })
+    except Exception as e:
+        print("Error:", str(e))  # Добавляем логирование ошибки
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/delete_car/<int:car_id>', methods=['DELETE'])
+@login_required
+def delete_car(car_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("DELETE FROM cars WHERE id = %s", (car_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/drivers')
+@login_required
+def drivers():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, full_name, phone_number, passport_number,created_at 
+        FROM drivers 
+        ORDER BY id
+    """)
+    drivers = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+    
+    return render_template('drivers.html', drivers=drivers)
+
+@app.route('/add_driver', methods=['POST'])
+@login_required
+def add_driver():
+    data = request.json
+    print("Received data:", data)  # Добавляем логирование
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO drivers (full_name, phone_number, passport_number)
+            VALUES (%s, %s, %s)
+            RETURNING id
+        """, (
+            data['full_name'],
+            data['phone_number'], 
+            data['passport_number']
+        ))
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        
+        cursor.execute("""
+            SELECT id, full_name, phone_number, passport_number, created_at  
+            FROM drivers WHERE id = %s
+        """, (new_id,))
+        new_driver = cursor.fetchone()
+        
+        return jsonify({
+            'success': True,
+            'driver': new_driver
+        })
+    except Exception as e:
+        print("Error:", str(e))  # Добавляем логирование ошибки
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/delete_driver/<int:driver_id>', methods=['DELETE'])
+@login_required
+def delete_driver(driver_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("DELETE FROM drivers WHERE id = %s", (driver_id,))
+        conn.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/available_products')
+@login_required
+def get_available_products():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT p.id, p.name 
+            FROM product_catalog p
+            JOIN stock_availability s ON p.barcode = s.barcode
+            WHERE s.total_quantity > 0
+        """)
+        products = [{"id": row[0], "name": row[1]} for row in cursor.fetchall()]
+        return jsonify(products)
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/product/<int:product_id>')
+@login_required
+def get_product(product_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT barcode, article_wb, quantity_per_box 
+            FROM product_catalog 
+            WHERE id = %s
+        """, (product_id,))
+        row = cursor.fetchone()
+        print('Database row:', row)  # Добавляем лог
+        if row:
+            product = {
+                "barcode": row[0],
+                "article_wb": row[1],
+                "quantity_per_box": row[2]
+            }
+            return jsonify(product)
+        return jsonify({"error": "Product not found"}), 404
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/warehouses')
+@login_required
+def get_warehouses():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT id, warehouse_name
+            FROM warehouses
+            ORDER BY warehouse_name
+        """)
+        warehouses = [{"id": row[0], "warehouse_name": row[1]} for row in cursor.fetchall()]
+        return jsonify(warehouses)
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/available_products')
+@login_required
+def available_products():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Запрос всех товаров, у которых есть в наличии (total_quantity > 0)
+    cursor.execute("""
+        SELECT 
+            barcode, 
+            name, 
+            article_wb, 
+            total_quantity,
+            quantity_per_box
+        FROM stock_availability
+        WHERE total_quantity > 0
+    """)
+
+    products = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    # Логируем результат запроса в консоль Flask (чтобы видеть, какие данные приходят)
+    print("Результат SQL-запроса:", products)
+
+    # Преобразуем список к JSON-формату
+    return jsonify([
+        {
+            "barcode": p[0],
+            "name": p[1],
+            "article_wb": p[2],
+            "available_quantity": p[3],  # Количество в наличии
+            "quantity_per_box": p[4]  # Количество в коробке
+        }
+        for p in products
+    ])
+
+
+@app.route('/deliveries')
+@login_required
+def deliveries():
+    return render_template('deliveries.html')
+
+@app.route('/api/add_delivery', methods=['POST'])
+@login_required
+def add_delivery():
+    data = request.json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO deliveries (
+                product_id, warehouse_id, delivery_number,
+                shipping_date, quantity, boxes_count
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data['product_id'],
+            data['warehouse_id'],
+            data['delivery_number'],
+            data['shipping_date'],
+            data['quantity'],
+            math.ceil(float(data['quantity']) / float(data['quantity_per_box']))
+        ))
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        return jsonify({'success': True, 'id': new_id})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'success': False, 'error': str(e)})
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/deduct-from-stock', methods=['POST'])
+@login_required
+def deduct_from_stock():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Получаем суммы количеств только по неспискным поставкам
+        cursor.execute("""
+            WITH delivery_totals AS (
+                SELECT product_id, SUM(quantity) as total_quantity
+                FROM deliveries
+                WHERE is_deducted = FALSE
+                GROUP BY product_id
+            )
+            UPDATE stock_availability sa
+            SET total_quantity = GREATEST(0, sa.total_quantity - COALESCE(dt.total_quantity, 0))
+            FROM delivery_totals dt
+            WHERE sa.product_id = dt.product_id
+            RETURNING sa.name, sa.total_quantity, dt.total_quantity as deducted_quantity
+        """)
+        
+        updated_products = cursor.fetchall()
+        
+        # Помечаем поставки как списанные
+        cursor.execute("""
+            UPDATE deliveries 
+            SET is_deducted = TRUE 
+            WHERE is_deducted = FALSE
+            RETURNING id
+        """)
+        
+        processed_count = cursor.rowcount
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'message': f'Списано {processed_count} поставок',
+            'details': updated_products
+        })
+
+    except Exception as e:
+        print(f"Ошибка при списании остатков: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/available_shipping_dates', methods=['GET'])
+@login_required
+def available_shipping_dates():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT shipping_date FROM deliveries ORDER BY shipping_date ASC")
+    dates = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify([date[0].strftime('%Y-%m-%d') for date in dates])
+
+def haversine(lat1, lon1, lat2, lon2):
+    """
+    Вычисляет расстояние между двумя точками (широта/долгота) в километрах.
+    """
+    R = 6371.0  # Радиус Земли в километрах
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    
+    return R * c
+
+@app.route('/api/build_routes', methods=['POST'])
+@login_required
+def build_routes():
+    selected_date = request.json.get('shipping_date')
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Получаем поставки на указанную дату (добавляем координаты складов)
+    cursor.execute("""
+        SELECT d.product_id, w.warehouse_name, d.warehouse_id, d.quantity, d.boxes_count, 
+       d.delivery_number, w.latitude, w.longitude
+
+        FROM deliveries d
+        JOIN warehouses w ON d.warehouse_id = w.id
+        WHERE d.shipping_date = %s
+    """, (selected_date,))
+    deliveries = cursor.fetchall()
+
+    # Получаем список складов с координатами
+    cursor.execute("SELECT warehouse_name, latitude, longitude FROM warehouses")
+    warehouses = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+    # Получаем список доступных машин (сортируем по вместимости)
+    cursor.execute("SELECT id, brand, plate_number, capacity, driver FROM cars ORDER BY capacity DESC")
+    cars = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    # Оптимизация маршрута с учетом координат
+    optimized_routes = optimize_routes(deliveries, warehouses, cars)
+
+    return jsonify({'success': True, 'routes': optimized_routes})
+
+def optimize_routes(deliveries, warehouses, cars):
+
+    # Группируем поставки по складам
+    deliveries_by_warehouse = defaultdict(list)
+    total_boxes_by_warehouse = {}
+
+    # 🔹 Исправленная распаковка
+    for product_id, warehouse_name, warehouse_id, quantity, boxes_count, delivery_number, lat, lon in deliveries:
+        print(f"DEBUG: warehouse_id={warehouse_id}, warehouse_name={warehouse_name}, delivery_number={delivery_number}")
+
+        deliveries_by_warehouse[warehouse_name].append(
+            (product_id, delivery_number, quantity, boxes_count)
+        )
+        total_boxes_by_warehouse[warehouse_name] = total_boxes_by_warehouse.get(warehouse_name, 0) + boxes_count
+
+    print("DEBUG: deliveries_by_warehouse:")
+    for key, value in deliveries_by_warehouse.items():
+        print(f"{key}: {value}")
+
+    print("DEBUG: total_boxes_by_warehouse:")
+    print(total_boxes_by_warehouse)
+
+    unassigned_warehouses = set(warehouse_name for _, warehouse_name, _, _, _, _, _, _ in deliveries)
+
+    routes = []
+    print("DEBUG: unassigned_warehouses:")
+    print(unassigned_warehouses)
+
+    print("DEBUG: warehouses dict keys (ожидаем warehouse_name):")
+    print(warehouses.keys())
+
+    available_cars = [(car[3], car[0], car[1], car[2], car[4]) for car in cars]
+    heapq.heapify(available_cars)
+
+    while unassigned_warehouses and available_cars:
+        car_capacity, car_id, brand, plate_number, driver = heapq.heappop(available_cars)
+        current_location = "Минск-Центральный"
+        remaining_capacity = car_capacity
+        route = []
+
+        while unassigned_warehouses:
+            print("DEBUG: warehouse_name, которые мы ищем в warehouses:")
+            print(unassigned_warehouses)
+
+            try:
+                nearest_warehouse = min(unassigned_warehouses, key=lambda wh: haversine(
+                    warehouses[wh][0], warehouses[wh][1],
+                    warehouses[current_location][0], warehouses[current_location][1]
+                ))
+            except KeyError as e:
+                print(f"ERROR: warehouse_name {e} не найден в warehouses! Возможно, передается warehouse_id?")
+                raise
+
+            print(f"DEBUG: Выбрали ближайший склад: {nearest_warehouse}")
+
+            distance = haversine(
+                warehouses[current_location][0], warehouses[current_location][1],
+                warehouses[nearest_warehouse][0], warehouses[nearest_warehouse][1]
+            )
+
+            if total_boxes_by_warehouse[nearest_warehouse] <= remaining_capacity:
+                route.append({
+                    'destination': nearest_warehouse,
+                    'distance': round(distance, 2),
+                    'deliveries': deliveries_by_warehouse[nearest_warehouse]
+                })
+                remaining_capacity -= total_boxes_by_warehouse[nearest_warehouse]
+                unassigned_warehouses.remove(nearest_warehouse)
+
+            else:
+                remaining_boxes = remaining_capacity
+                partial_deliveries = []
+                for delivery in deliveries_by_warehouse[nearest_warehouse]:
+                    if remaining_boxes <= 0:
+                        break
+                    product_id, quantity, boxes_count = delivery
+                    if boxes_count <= remaining_boxes:
+                        partial_deliveries.append(delivery)
+                        remaining_boxes -= boxes_count
+                    else:
+                        partial_deliveries.append((product_id, quantity, remaining_boxes))
+                        remaining_boxes = 0
+
+                if partial_deliveries:
+                    route.append({
+                        'destination': nearest_warehouse,
+                        'distance': round(distance, 2),
+                        'deliveries': partial_deliveries
+                    })
+
+                total_boxes_by_warehouse[nearest_warehouse] -= remaining_capacity
+                remaining_capacity = 0
+
+            if remaining_capacity == 0:
+                break
+
+        optimized_route = optimize_tsp(route, warehouses)
+
+        if optimized_route:
+            routes.append({
+                'car': f"{brand} ({plate_number}) - {driver}",
+                'route': optimized_route
+            })
+
+    return routes
+
+def optimize_tsp(route, warehouses):
+    """
+    Решает задачу Коммивояжера для минимизации маршрута на основе координат.
+    """
+
+    if len(route) <= 1:
+        return route  # Если только один склад, нет смысла оптимизировать
+
+    best_order = None
+    best_distance = float("inf")
+
+    warehouses_in_route = [r['destination'] for r in route]
+    
+    for perm in permutations(warehouses_in_route):
+        total_distance = 0
+        current_location = "Минск-Центральный"
+
+        for wh in perm:
+            total_distance += haversine(
+                warehouses[current_location][0], warehouses[current_location][1],
+                warehouses[wh][0], warehouses[wh][1]
+            )
+            current_location = wh
+
+        total_distance += haversine(
+            warehouses[current_location][0], warehouses[current_location][1],
+            warehouses["Минск-Центральный"][0], warehouses["Минск-Центральный"][1]
+        )  # Возвращение
+
+        if total_distance < best_distance:
+            best_distance = total_distance
+            best_order = perm
+
+    if best_order:
+        return sorted(route, key=lambda r: best_order.index(r['destination']))
+    
+    return route  # Если не удалось оптимизировать
+
+@app.route('/api/save-route-sheet', methods=['POST'])
+@login_required
+def save_route_sheet():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        route_data = request.json
+        print("Received route_data:", route_data)  # Для отладки
+        
+        # Проверяем наличие всех необходимых полей
+        required_fields = ['product_id', 'warehouse_id', 'delivery_number',
+                           'quantity', 'boxes_count', 'route_description', 
+                           'car_model', 'shipping_date']
+        for field in required_fields:
+            if field not in route_data:
+                raise ValueError(f"Missing required field: {field}")
+
+        # Получаем информацию о товаре
+        cursor.execute("""
+            SELECT name, barcode, article_wb
+            FROM stock_availability
+            WHERE product_id = %s
+        """, (route_data['product_id'],))
+        product_info = cursor.fetchone()
+
+        if not product_info:
+            raise Exception(f"Product not found with ID: {route_data['product_id']}")
+
+        # Получаем цену из sales_pricing
+        cursor.execute("""
+            SELECT final_price 
+            FROM sales_pricing 
+            WHERE article_wb = %s
+        """, (product_info[2],))  # product_info[2] это article_wb
+        price_info = cursor.fetchone()
+        
+        if not price_info:
+            raise Exception(f"Price not found for article_wb: {product_info[2]}")
+
+        price_per_unit = price_info[0]
+        total_amount = price_per_unit * route_data['quantity']
+        
+        # Получаем информацию о складе
+        cursor.execute("""
+            SELECT warehouse_name, recipient_name, phone_number
+            FROM warehouses
+            WHERE id = %s
+        """, (route_data['warehouse_id'],))
+        warehouse_info = cursor.fetchone()
+
+        if not warehouse_info:
+            raise Exception(f"Warehouse not found with ID: {route_data['warehouse_id']}")
+
+        # Разбираем car_model на модель и водителя
+        car_info = route_data['car_model'].split(' - ')
+        car_model = car_info[0]
+        driver_name = car_info[1] if len(car_info) > 1 else ''
+
+        # Извлекаем номер машины из скобок в car_model
+        car_number = ''
+        if '(' in car_model and ')' in car_model:
+            car_number = car_model[car_model.find('(')+1:car_model.find(')')]
+            car_model = car_model[:car_model.find('(')].strip()
+
+        # Сохраняем информацию в route_sheets
+        cursor.execute("""
+            INSERT INTO route_sheets (
+                product_name, barcode, article_wb,
+                warehouse_name, delivery_number, shipping_date,
+                quantity, boxes_count, route_description,
+                car_model, car_number, driver_name,
+                recipient_name, recipient_phone, sender_name,
+                price_per_unit, total_amount
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+        """, (
+            product_info[0], product_info[1], product_info[2],
+            warehouse_info[0], route_data.get('delivery_number', ''),
+            route_data['shipping_date'], route_data['quantity'],
+            route_data['boxes_count'], route_data['route_description'],
+            car_model, car_number, driver_name,
+            warehouse_info[1], warehouse_info[2],
+            'Ларин Евгений Александрович',
+            price_per_unit, total_amount
+        ))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'message': 'Маршрутный лист успешно сохранен'
+        })
+
+    except Exception as e:
+        print(f"Ошибка при сохранении маршрутного листа: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/get_warehouse_id/<warehouse_name>')
+@login_required
+def get_warehouse_id(warehouse_name):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id 
+            FROM warehouses 
+            WHERE warehouse_name = %s
+        """, (warehouse_name,))
+        
+        result = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if result:
+            return jsonify({'warehouse_id': result[0]})
+        else:
+            return jsonify({'error': f'Warehouse not found: {warehouse_name}'}), 404
+            
+    except Exception as e:
+        print(f"Error getting warehouse id: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/route-sheets')
+@login_required
+def route_sheets():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        cursor.execute("""
+            SELECT 
+                product_name, barcode, article_wb,
+                warehouse_name, delivery_number, shipping_date,
+                quantity, boxes_count,
+                price_per_unit, total_amount,
+                route_description, car_model, car_number,
+                driver_name, recipient_name, recipient_phone,
+                sender_name
+            FROM route_sheets
+            ORDER BY shipping_date DESC, warehouse_name
+        """)
+        
+        route_sheets = cursor.fetchall()
+
+        # Получаем уникальные склады
+        cursor.execute("SELECT DISTINCT warehouse_name FROM route_sheets")
+        warehouses = [row[0] for row in cursor.fetchall()]
+        
+        cursor.close()
+        conn.close()
+        
+        return render_template(
+            'route_sheets.html', 
+            route_sheets=route_sheets,
+            warehouses=warehouses  #  Добавляем список складов
+        )
+        
+    except Exception as e:
+        print(f"Ошибка при получении маршрутных листов: {str(e)}")
+        flash('Ошибка при загрузке маршрутных листов', 'error')
+        return render_template('route_sheets.html', route_sheets=[], error=str(e))
+
+import urllib.parse
+
+@app.route('/api/export-route-sheets', methods=['POST'])
+@login_required
+def export_route_sheets():
+    try:
+        data = request.json
+        selected_columns = data.get('columns', [])
+        warehouse = data.get('warehouse', '')
+
+        if not selected_columns:
+            return jsonify({"error": "Выберите хотя бы один столбец"}), 400
+
+        if not warehouse:
+            return jsonify({"error": "Выберите склад"}), 400
+
+        # Словарь соответствий колонок
+        column_mapping = {
+            "product_name": "Наименование",
+            "barcode": "Баркод",
+            "quantity": "Количество товара",
+            "price_per_unit": "Цена за 1 шт, ₽",
+            "total_amount": "Общая сумма, ₽",
+            "recipient_name": "ФИО Получателя",
+            "sender_name": "ФИО Отправителя",
+            "route_description": "Маршрут",
+            "car_model": "Машина",
+            "driver_name": "Водитель"
+        }
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Запрос данных только по выбранному складу
+        query = f"""
+            SELECT {', '.join(selected_columns)}
+            FROM route_sheets
+            WHERE warehouse_name = %s
+            ORDER BY shipping_date DESC
+        """
+        cursor.execute(query, (warehouse,))
+        rows = cursor.fetchall()
+
+        df = pd.DataFrame(rows, columns=selected_columns)
+
+        # Переименовываем колонки в соответствии с UI
+        df.rename(columns=column_mapping, inplace=True)
+
+        
+
+        # Создаем Excel в памяти
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name=f"Маршрут_{warehouse}")
+
+            # Автоматическая ширина колонок
+            workbook = writer.book
+            worksheet = writer.sheets[f"Маршрут_{warehouse}"]
+
+            for i, col in enumerate(df.columns):
+                max_len = max(
+                    df[col].astype(str).apply(len).max(),  # Длина самого длинного значения
+                    len(col)  # Длина заголовка
+                ) + 2  # Добавляем небольшой отступ
+                worksheet.set_column(i, i, max_len)
+
+        output.seek(0)
+
+        # Кодируем имя файла для безопасной передачи
+        safe_filename = urllib.parse.quote(f"Маршрутный_лист_{warehouse}.xlsx", safe='')
+
+        return Response(
+            output.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"}
+        )
+    
+    except Exception as e:
+        print(f"Ошибка экспорта: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    app.run(debug=True)
